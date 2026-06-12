@@ -16,6 +16,28 @@ pub struct PayrollEntry {
     pub active: bool,
 }
 
+#[contracttype]
+pub struct PayrollScheduledEvent {
+    pub org_id: u64,
+    pub recipient: String,
+    pub amount: i128,
+    pub currency: String,
+    pub interval_secs: u64,
+    pub next_payout: u64,
+    pub index: u32,
+}
+
+#[contracttype]
+pub struct PayrollPaidEvent {
+    pub index: u32,
+    pub next_payout: u64,
+}
+
+#[contracttype]
+pub struct PayrollCancelledEvent {
+    pub index: u32,
+}
+
 #[contract]
 pub struct PayrollContract;
 
@@ -47,18 +69,33 @@ impl PayrollContract {
             .get(&symbol_short!("entries"))
             .unwrap_or(Vec::new(&env));
 
+        let next_payout = env.ledger().timestamp() + interval_secs;
         let entry = PayrollEntry {
             org_id,
-            recipient,
+            recipient: recipient.clone(),
             amount,
-            currency,
+            currency: currency.clone(),
             interval_secs,
-            next_payout: env.ledger().timestamp() + interval_secs,
+            next_payout,
             active: true,
         };
         entries.push_back(entry);
         let idx = entries.len() - 1;
         env.storage().instance().set(&symbol_short!("entries"), &entries);
+
+        env.events().publish(
+            (symbol_short!("scheduled"),),
+            PayrollScheduledEvent {
+                org_id,
+                recipient,
+                amount,
+                currency,
+                interval_secs,
+                next_payout,
+                index: idx,
+            },
+        );
+
         idx
     }
 
@@ -77,6 +114,11 @@ impl PayrollContract {
         entry.active = false;
         entries.set(index, entry);
         env.storage().instance().set(&symbol_short!("entries"), &entries);
+
+        env.events().publish(
+            (symbol_short!("cancelled"),),
+            PayrollCancelledEvent { index },
+        );
     }
 
     /// Mark an entry as paid and advance the next_payout timestamp.
@@ -99,8 +141,17 @@ impl PayrollContract {
             panic!("payout not due yet");
         }
         entry.next_payout = now + entry.interval_secs;
+        let new_next_payout = entry.next_payout;
         entries.set(index, entry);
         env.storage().instance().set(&symbol_short!("entries"), &entries);
+
+        env.events().publish(
+            (symbol_short!("paid"),),
+            PayrollPaidEvent {
+                index,
+                next_payout: new_next_payout,
+            },
+        );
     }
 
     pub fn get_entry(env: Env, index: u32) -> PayrollEntry {
@@ -136,7 +187,10 @@ impl PayrollContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Ledger, Env, String};
+    use soroban_sdk::{
+        testutils::{Events, Ledger},
+        vec, IntoVal, Env, String,
+    };
 
     #[test]
     fn test_schedule_and_get() {
@@ -186,5 +240,122 @@ mod tests {
         client.mark_paid(&admin, &0);
         let entry = client.get_entry(&0);
         assert_eq!(entry.next_payout, 86401 + 86400);
+    }
+
+    #[test]
+    fn test_schedule_emits_event() {
+        let env = Env::default();
+        env.ledger().set_timestamp(0);
+        let contract_id = env.register_contract(None, PayrollContract);
+        let client = PayrollContractClient::new(&env, &contract_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        env.mock_all_auths();
+        client.init(&admin);
+
+        client.schedule(
+            &admin,
+            &1u64,
+            &String::from_str(&env, "GADDR"),
+            &5000i128,
+            &String::from_str(&env, "USDC"),
+            &2592000u64,
+        );
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events,
+            vec![
+                &env,
+                (
+                    contract_id.clone(),
+                    (symbol_short!("scheduled"),).into_val(&env),
+                    PayrollScheduledEvent {
+                        org_id: 1u64,
+                        recipient: String::from_str(&env, "GADDR"),
+                        amount: 5000i128,
+                        currency: String::from_str(&env, "USDC"),
+                        interval_secs: 2592000u64,
+                        next_payout: 2592000u64,
+                        index: 0u32,
+                    }
+                    .into_val(&env),
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mark_paid_emits_event() {
+        let env = Env::default();
+        env.ledger().set_timestamp(0);
+        let contract_id = env.register_contract(None, PayrollContract);
+        let client = PayrollContractClient::new(&env, &contract_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        env.mock_all_auths();
+        client.init(&admin);
+        client.schedule(
+            &admin,
+            &1u64,
+            &String::from_str(&env, "GADDR"),
+            &1000i128,
+            &String::from_str(&env, "USDC"),
+            &86400u64,
+        );
+
+        env.ledger().set_timestamp(86401);
+        client.mark_paid(&admin, &0);
+
+        // Two events: payroll_scheduled and payroll_paid
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events.get(1),
+            (
+                contract_id.clone(),
+                (symbol_short!("paid"),).into_val(&env),
+                PayrollPaidEvent {
+                    index: 0u32,
+                    next_payout: 86401u64 + 86400u64,
+                }
+                .into_val(&env),
+            )
+        );
+    }
+
+    #[test]
+    fn test_cancel_emits_event() {
+        let env = Env::default();
+        env.ledger().set_timestamp(0);
+        let contract_id = env.register_contract(None, PayrollContract);
+        let client = PayrollContractClient::new(&env, &contract_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        env.mock_all_auths();
+        client.init(&admin);
+        client.schedule(
+            &admin,
+            &1u64,
+            &String::from_str(&env, "GADDR"),
+            &1000i128,
+            &String::from_str(&env, "USDC"),
+            &86400u64,
+        );
+
+        client.cancel(&admin, &0);
+
+        // Two events: payroll_scheduled and payroll_cancelled
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events.get(1),
+            (
+                contract_id.clone(),
+                (symbol_short!("cancelled"),).into_val(&env),
+                PayrollCancelledEvent { index: 0u32 }.into_val(&env),
+            )
+        );
     }
 }
